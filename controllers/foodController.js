@@ -1,46 +1,97 @@
-import express from "express";
 import axios from "axios";
-import dotenv from "dotenv";
 
-dotenv.config();
-const router = express.Router();
+function toRad(value) {
+  return (value * Math.PI) / 180;
+}
 
-router.get("/:city", async (req, res) => {
-  const { city } = req.params;
+function distanceInMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+export const getFood = async (req, res) => {
+  const { lat, lon } = req.query;
 
   try {
-    
-    const geoResponse = await axios.get(
-      `https://nominatim.openstreetmap.org/search?city=${city}&format=json`
-    );
+    const latNum = parseFloat(lat);
+    const lonNum = parseFloat(lon);
 
-    if (!geoResponse.data.length) {
-      return res.status(404).json({ message: "City not found" });
+    if (isNaN(latNum) || isNaN(lonNum)) {
+      return res.status(400).json({ message: "lat and lon must be numbers" });
     }
 
-    const { lat, lon } = geoResponse.data[0];
+    // bigger radius so we actually find stuff
+    const radius = 7000;
 
-    
-    const fsqResponse = await axios.get(
-      "https://api.foursquare.com/v3/places/search",
+    // more food categories
+    const query = `
+[out:json][timeout:25];
+(
+  nwr["amenity"~"restaurant|cafe|fast_food|food_court|ice_cream|pub|biergarten|bar|bakery"](around:${radius},${latNum},${lonNum});
+);
+out center 60;
+`;
+
+    const response = await axios.post(
+      "https://overpass-api.de/api/interpreter",
+      `data=${encodeURIComponent(query)}`,
       {
         headers: {
-          Authorization: process.env.FOURSQUARE_API_KEY,
-        },
-        params: {
-          ll: `${lat},${lon}`,
-          categories: "13065", 
-          limit: 10,
+          "Content-Type": "application/x-www-form-urlencoded",
         },
       }
     );
 
-    
-    res.json(fsqResponse.data.results);
-  } catch (err) {
-    console.error("Error fetching food data:", err.message);
-    res.status(500).json({ message: "Error fetching food data" });
-  }
-});
+    const elements = response.data?.elements || [];
+    console.log("Overpass returned elements:", elements.length);
 
-export default router;
+    const places = elements
+      .map((el) => {
+        const tags = el.tags || {};
+        const name = tags.name || "Unnamed place";
+        const category = tags.amenity || "";
+        const latPlace = el.lat || el.center?.lat;
+        const lonPlace = el.lon || el.center?.lon;
+
+        if (!latPlace || !lonPlace) return null;
+
+        const addressParts = [
+          tags["addr:housenumber"],
+          tags["addr:street"],
+          tags["addr:city"],
+        ].filter(Boolean);
+
+        const address = addressParts.join(", ");
+
+        const distance = distanceInMeters(latNum, lonNum, latPlace, lonPlace);
+
+        return {
+          name,
+          category,
+          address,
+          lat: latPlace,
+          lon: lonPlace,
+          distance,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, 20);
+
+    console.log("Food places found:", places.length);
+
+    return res.status(200).json(places);
+  } catch (err) {
+    console.error("Overpass food error:", err.message);
+    return res.status(500).json({ message: "Error fetching nearby food data" });
+  }
+};
